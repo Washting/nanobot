@@ -1,11 +1,16 @@
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.agent.loop import AgentLoop
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.channels.manager import ChannelManager
 from nanobot.channels.telegram import TelegramChannel
-from nanobot.config.schema import TelegramConfig
+from nanobot.config.schema import Config, TelegramConfig
+from nanobot.providers.base import LLMResponse
 
 
 class _FakeHTTPXRequest:
@@ -182,3 +187,57 @@ async def test_send_reply_infers_topic_from_message_id_cache() -> None:
 
     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
     assert channel._app.bot.sent_messages[0]["reply_parameters"].message_id == 10
+
+
+@pytest.mark.asyncio
+async def test_reasoning_progress_reaches_telegram_via_channel_dispatch(tmp_path) -> None:
+    bus = MessageBus()
+    config = Config(
+        channels={
+            "sendProgress": True,
+            "sendToolHints": False,
+            "telegram": {"enabled": True, "token": "123:abc", "allowFrom": ["*"]},
+        }
+    )
+    channels = ChannelManager(config, bus)
+    channel = channels.get_channel("telegram")
+    assert isinstance(channel, TelegramChannel)
+    channel._app = _FakeApp(lambda: None)
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat = AsyncMock(return_value=LLMResponse(
+        content="final answer",
+        tool_calls=[],
+        reasoning_content="raw reasoning",
+    ))
+
+    loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        memory_window=10,
+    )
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    dispatcher = asyncio.create_task(channels._dispatch_outbound())
+    try:
+        result = await loop._process_message(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="123", content="hi")
+        )
+        assert result is not None
+        await bus.publish_outbound(result)
+
+        async def _wait_for_sent(count: int) -> None:
+            while len(channel._app.bot.sent_messages) < count:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait_for_sent(2), timeout=1.0)
+
+        sent_texts = [m["text"] for m in channel._app.bot.sent_messages]
+        assert sent_texts == ["<i>[reasoning]</i>\nraw reasoning", "final answer"]
+    finally:
+        dispatcher.cancel()
+        await dispatcher
+        assert dispatcher.done()

@@ -1,5 +1,6 @@
 """Test message tool suppress logic for final replies."""
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -114,6 +115,93 @@ class TestMessageToolSuppressLogic:
             ("Visible", False),
             ('read_file("foo.txt")', True),
         ]
+
+    async def test_progress_emits_raw_reasoning_when_enabled(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(
+                content="Visible<think>hidden</think>",
+                tool_calls=[tool_call],
+                reasoning_content="raw reasoning",
+            ),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        progress: list[tuple[str, bool]] = []
+
+        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+            progress.append((content, tool_hint))
+
+        final_content, _, _ = await loop._run_agent_loop([], on_progress=on_progress, emit_reasoning=True)
+
+        assert final_content == "Done"
+        assert progress == [
+            ("_[reasoning]_\nraw reasoning", False),
+            ("Visible", False),
+            ('read_file("foo.txt")', True),
+        ]
+
+    @pytest.mark.parametrize(
+        ("response", "expected_reasoning"),
+        [
+            (
+                LLMResponse(content="Done", tool_calls=[], reasoning_content="r1"),
+                "_[reasoning]_\nr1",
+            ),
+            (
+                LLMResponse(
+                    content="Done",
+                    tool_calls=[],
+                    thinking_blocks=[{"signature": "sig", "thought": "raw block"}],
+                ),
+                "_[reasoning]_\n" + json.dumps([{"signature": "sig", "thought": "raw block"}], ensure_ascii=False),
+            ),
+            (
+                LLMResponse(content="Visible<think>fallback think</think>", tool_calls=[]),
+                "_[reasoning]_\nfallback think",
+            ),
+        ],
+    )
+    async def test_progress_reasoning_source_priority(self, tmp_path: Path, response: LLMResponse, expected_reasoning: str) -> None:
+        loop = _make_loop(tmp_path)
+        loop.provider.chat = AsyncMock(return_value=response)
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        progress: list[tuple[str, bool]] = []
+
+        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+            progress.append((content, tool_hint))
+
+        await loop._run_agent_loop([], on_progress=on_progress, emit_reasoning=True)
+
+        assert progress == [(expected_reasoning, False)]
+
+    @pytest.mark.asyncio
+    async def test_process_message_emits_reasoning_only_for_telegram(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        loop.provider.chat = AsyncMock(return_value=LLMResponse(
+            content="Done",
+            tool_calls=[],
+            reasoning_content="telegram reasoning",
+        ))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        tg = InboundMessage(channel="telegram", sender_id="u", chat_id="c1", content="hi")
+        other = InboundMessage(channel="feishu", sender_id="u", chat_id="c2", content="hi")
+
+        await loop._process_message(tg)
+        assert loop.bus.outbound_size == 1
+        progress = await loop.bus.consume_outbound()
+        assert progress.content == "_[reasoning]_\ntelegram reasoning"
+        assert progress.metadata["_progress"] is True
+        assert progress.metadata["_tool_hint"] is False
+
+        await loop._process_message(other)
+        assert loop.bus.outbound_size == 0
 
 
 class TestMessageToolTurnTracking:

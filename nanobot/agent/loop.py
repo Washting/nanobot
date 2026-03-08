@@ -167,6 +167,31 @@ class AgentLoop:
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
 
     @staticmethod
+    def _extract_think(text: str | None) -> str | None:
+        """Extract raw <think>…</think> content if present."""
+        if not text:
+            return None
+        chunks = re.findall(r"<think>([\s\S]*?)</think>", text)
+        if not chunks:
+            return None
+        merged = "\n\n".join(chunk.strip() for chunk in chunks if chunk and chunk.strip())
+        return merged or None
+
+    @staticmethod
+    def _extract_reasoning_progress(response) -> str | None:
+        """Extract reasoning payload in priority order for optional progress output."""
+        if response.reasoning_content:
+            return response.reasoning_content
+        if response.thinking_blocks:
+            return json.dumps(response.thinking_blocks, ensure_ascii=False)
+        return AgentLoop._extract_think(response.content)
+
+    @staticmethod
+    def _format_reasoning_progress(reasoning: str) -> str:
+        """Attach a first-line reasoning marker for channel display."""
+        return f"_[reasoning]_\n{reasoning}"
+
+    @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
         def _fmt(tc):
@@ -181,6 +206,7 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        emit_reasoning: bool = False,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -202,6 +228,8 @@ class AgentLoop:
 
             if response.has_tool_calls:
                 if on_progress:
+                    if emit_reasoning and (reasoning := self._extract_reasoning_progress(response)):
+                        await on_progress(self._format_reasoning_progress(reasoning))
                     thought = self._strip_think(response.content)
                     if thought:
                         await on_progress(thought)
@@ -233,6 +261,8 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
+                if on_progress and emit_reasoning and (reasoning := self._extract_reasoning_progress(response)):
+                    await on_progress(self._format_reasoning_progress(reasoning))
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
                 # poison the context and cause permanent 400 loops (#1303).
@@ -434,6 +464,7 @@ class AgentLoop:
 
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
+            emit_reasoning=(msg.channel == "telegram"),
         )
 
         if final_content is None:
