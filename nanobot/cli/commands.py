@@ -296,14 +296,18 @@ def gateway(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Start the nanobot gateway."""
+    from loguru import logger
+
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
+    from nanobot.config.loader import get_config_path
     from nanobot.config.paths import get_cron_dir
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.session.manager import SessionManager
+    from nanobot.web.log_buffer import LogBuffer
 
     if verbose:
         import logging
@@ -316,6 +320,11 @@ def gateway(
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
+    log_buffer = LogBuffer(max_entries=2000)
+    try:
+        log_sink_id = logger.add(log_buffer.sink, level="DEBUG", enqueue=True)
+    except PermissionError:
+        log_sink_id = logger.add(log_buffer.sink, level="DEBUG", enqueue=False)
 
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_cron_dir() / "jobs.json"
@@ -384,7 +393,13 @@ def gateway(
     cron.on_job = on_cron_job
 
     # Create channel manager
-    channels = ChannelManager(config, bus)
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        log_buffer=log_buffer,
+        config_path=get_config_path(),
+    )
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
@@ -450,6 +465,7 @@ def gateway(
 
     async def run():
         try:
+            log_buffer.bind_loop(asyncio.get_running_loop())
             await cron.start()
             await heartbeat.start()
             await asyncio.gather(
@@ -464,6 +480,7 @@ def gateway(
             cron.stop()
             agent.stop()
             await channels.stop_all()
+            logger.remove(log_sink_id)
 
     asyncio.run(run())
 

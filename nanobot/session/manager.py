@@ -113,6 +113,16 @@ class SessionManager:
         self._cache[key] = session
         return session
 
+    def get(self, key: str) -> Session | None:
+        """Get an existing session without creating a new one."""
+        if key in self._cache:
+            return self._cache[key]
+        session = self._load(key)
+        if session is None:
+            return None
+        self._cache[key] = session
+        return session
+
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
@@ -182,6 +192,22 @@ class SessionManager:
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+
+    def delete(self, key: str) -> bool:
+        """Delete a session from disk and cache."""
+        deleted = False
+        path = self._get_session_path(key)
+        if path.exists():
+            path.unlink()
+            deleted = True
+
+        legacy_path = self._get_legacy_session_path(key)
+        if legacy_path.exists():
+            legacy_path.unlink()
+            deleted = True
+
+        self.invalidate(key)
+        return deleted
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """
